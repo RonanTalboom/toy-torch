@@ -1,0 +1,16 @@
+[package]
+name = "toy-torch"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal PyTorch-shaped crate: tensors, autograd, graph IR, constant-fold + DCE compiler passes. Built to teach DL compiler internals."
+license = "MIT"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
