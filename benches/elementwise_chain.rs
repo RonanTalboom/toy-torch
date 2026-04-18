@@ -1,32 +1,32 @@
-//! Three-way comparison on a memory-bound elementwise chain:
+//! Four-way comparison on a memory-bound elementwise chain:
 //!
 //!     out = relu((x - y) * z) + x * k
 //!
 //! **eager_vec** — plain Rust slices with one intermediate Vec<f32> per op.
-//!   This is what you'd write if you didn't have any framework at all. Five
-//!   allocations, five passes through memory.
+//!   Five allocations, five passes through memory.
 //!
-//! **fused_interp** — toy-torch's `Graph::eval()` on the post-fusion graph.
-//!   One allocation, one pass — but the per-element work is a recursive
-//!   `match` on the expression tree. This is what a naive IR interpreter
-//!   pays.
+//! **fused_interp** — `Graph::eval()` on the post-fusion graph. One allocation,
+//!   one pass, but per-element match dispatch on the expression tree — slow.
 //!
-//! **hand_fused** — what `emit_rust` would produce: a tight `for i in 0..n`
-//!   loop with the whole recipe inlined. One allocation, one pass, no
-//!   per-element dispatch. The speedup of `hand_fused` over `fused_interp`
-//!   is exactly the gap that JIT / AOT codegen closes in a real compiler.
+//! **hand_fused** — a hand-rolled single loop that inlines the whole recipe.
+//!   What `emit_c` generates. One allocation, one pass, no dispatch. Ceiling.
 //!
-//! The pedagogical point: fusion *structure* alone doesn't buy speedup;
-//! fusion *plus codegen* does. Inductor emits Triton for this reason. TVM
-//! emits LLVM. Our emit_rust would need to be wired to cargo+cc to close
-//! the gap, which is on the v0.5 roadmap.
+//! **fused_jit** — `JitKernel::compile` emits C, shells out to `cc -O3`,
+//!   dlopens the shared library, calls `kernel`. Real JIT-compiled code. The
+//!   point of v0.5: close the `fused_interp` → `hand_fused` gap for real.
+//!
+//! Pedagogical result: fusion *structure* without codegen is a speed loss
+//! vs eager. Fusion + codegen is a speed win. Real ML compilers
+//! (TorchInductor, XLA, TVM) never interpret their IR — they always codegen.
 
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use toy_torch::graph::compile::{constant_fold, dead_code_elim};
 use toy_torch::graph::fusion::fuse_elementwise;
+use toy_torch::graph::jit::JitKernel;
 use toy_torch::graph::tracer::trace;
+use toy_torch::op::Op;
 use toy_torch::{Tape, Tensor};
 
 fn build_inputs(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -111,6 +111,48 @@ fn bench_chain(c: &mut Criterion) {
         let g = build_fused_graph(n);
         group.bench_with_input(BenchmarkId::new("fused_interp", n), &n, |b, &_n| {
             b.iter(|| g.eval());
+        });
+
+        // JIT-compiled kernel. Pre-compile once; reuse across iterations.
+        // The recipe comes from the same fused graph — find the Fused node and
+        // extract its recipe + external-input count.
+        let fused_node = g
+            .nodes
+            .iter()
+            .find(|n| n.op == Op::Fused)
+            .expect("bench: graph should contain a Fused node");
+        let recipe = fused_node
+            .recipe
+            .as_ref()
+            .expect("Fused node missing recipe");
+
+        // Map fused-node external inputs back to the leaf data slices. The
+        // fusion pass orders inputs by first-use in the expression. We find
+        // which leaf each external input points to and present the slices in
+        // that order.
+        let external_slices: Vec<&[f32]> = fused_node
+            .inputs
+            .iter()
+            .map(|&nid| {
+                // Each external input points to a Leaf node holding a Tensor.
+                let node = &g.nodes[nid.0];
+                assert_eq!(node.op, Op::Leaf, "bench: fused external input not a leaf");
+                let t = node.constant.as_ref().expect("leaf missing tensor");
+                // SAFETY: graph outlives the bench loop (moved into JIT closure
+                // below); slice is tied to that lifetime.
+                let data_ptr = t.data().as_ptr();
+                unsafe { std::slice::from_raw_parts(data_ptr, n) }
+            })
+            .collect();
+
+        let jit = JitKernel::compile(recipe, external_slices.len())
+            .expect("bench: JitKernel::compile failed");
+
+        group.bench_with_input(BenchmarkId::new("fused_jit", n), &n, |b, &_n| {
+            let mut out = vec![0.0f32; n];
+            b.iter(|| {
+                jit.call(&external_slices, &mut out);
+            });
         });
     }
     group.finish();

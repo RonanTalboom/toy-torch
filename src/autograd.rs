@@ -114,10 +114,13 @@ impl Tape {
                     accumulate(&mut grads, a, &ga);
                     accumulate(&mut grads, b, &gb);
                 }
-                Op::Fused => {
-                    // Fused nodes only appear on compiled graphs, not tapes.
-                    // The tape's backward sees original elementwise nodes.
-                    unreachable!("Fused should not appear on the tape; only in compiled graphs");
+                Op::Fused | Op::FusedSum => {
+                    // Fused / FusedSum only appear on compiled graphs, not
+                    // tapes. The tape's backward sees original ops.
+                    unreachable!(
+                        "{:?} should not appear on the tape; only in compiled graphs",
+                        node.op
+                    );
                 }
             }
         }

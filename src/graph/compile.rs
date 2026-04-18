@@ -93,7 +93,7 @@ fn eval_const(g: &Graph, op: Op, inputs: &[NodeId]) -> Tensor {
             Tensor::new(data, t.shape().clone()).expect("relu fold")
         }
         Op::Sum => as_tensor(inputs[0]).sum(),
-        Op::Leaf | Op::Const | Op::Matmul | Op::Fused => {
+        Op::Leaf | Op::Const | Op::Matmul | Op::Fused | Op::FusedSum => {
             unreachable!("op {:?} not in is_foldable set", op)
         }
     }

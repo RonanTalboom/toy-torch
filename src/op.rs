@@ -22,6 +22,10 @@ pub enum Op {
     /// fusion compiler pass. The associated recipe lives in
     /// [`crate::graph::fusion::FusedRecipe`] and is stored on the graph node.
     Fused,
+    /// A fused chain whose output is also summed to a scalar — produced by
+    /// the reduction-fusion pass, which detects `Sum ← Fused` and collapses
+    /// them into a single kernel with a running accumulator.
+    FusedSum,
 }
 
 impl Op {

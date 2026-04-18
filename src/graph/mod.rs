@@ -11,7 +11,9 @@
 pub mod codegen;
 pub mod compile;
 pub mod fusion;
+pub mod jit;
 pub mod node;
+pub mod reduction;
 pub mod tracer;
 
 pub use node::Node;
@@ -105,6 +107,11 @@ impl Graph {
                     let recipe = node.recipe.as_ref().expect("Fused node missing recipe");
                     let inputs: Vec<&Tensor> = node.inputs.iter().map(|i| &vals[i]).collect();
                     recipe.eval(&inputs)
+                }
+                Op::FusedSum => {
+                    let recipe = node.recipe.as_ref().expect("FusedSum node missing recipe");
+                    let inputs: Vec<&Tensor> = node.inputs.iter().map(|i| &vals[i]).collect();
+                    recipe.eval_sum(&inputs)
                 }
             };
             vals.insert(id, out);

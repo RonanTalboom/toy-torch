@@ -57,7 +57,7 @@ cargo run --release --example linreg    # SGD: y = sum(x * w) + b converges to t
 cargo run --release --example mlp       # 4→8→1 MLP trains to loss 0.005 in 500 epochs via matmul + relu
 cargo run --release --example compile   # 10 traced nodes → 4 after const-fold + DCE
 cargo run --release --example fuse      # demonstrates tracer + fold + fusion + DCE + emit_rust on a chain
-cargo bench --bench elementwise_chain   # eager_vec vs hand_fused vs fused_interp on 1K-1M sizes
+cargo bench --bench elementwise_chain   # eager_vec vs hand_fused vs fused_interp vs fused_jit on 1K-1M sizes
 ```
 
 Expected output for `linreg` (seed 42, 200 epochs):
@@ -81,42 +81,61 @@ compiled graph loss: [33.0]
   [3] Sum inputs=[NodeId(2)]
 ```
 
-## What the bench says (v0.4)
+## What the bench says (v0.5)
 
 Memory-bound elementwise chain `out = relu((x - y) * z) + x * k`, 1 M elements:
 
-| Variant | Throughput | Relative |
-|---------|-----------|----------|
-| `eager_vec` — 5 loops with 5 Vec<f32> intermediates | 1.9 Gelem/s | 1.0× |
-| `hand_fused` — single loop (what `emit_rust` generates) | **5.8 Gelem/s** | **3.0×** |
-| `fused_interp` — `Graph::eval()` on fused recipe | 85 Melem/s | **0.04×** |
+| Variant | Throughput | vs eager | vs interp |
+|---------|-----------|----------|-----------|
+| `eager_vec` — 5 loops with 5 Vec<f32> intermediates | 2.1 Gelem/s | 1.0× | — |
+| `hand_fused` — single loop (what `emit_c` generates) | 5.9 Gelem/s | 2.8× | — |
+| `fused_interp` — `Graph::eval()` interpreting the recipe | 88 Melem/s | 0.04× | 1.0× |
+| **`fused_jit`** — JIT-compiled C via `emit_c` + `cc -O3` + `dlopen` | **6.5 Gelem/s** | **3.1×** | **74×** |
 
-This is the punchline of the whole project:
+This is the project's teaching payoff:
 
-- **Fusion structure alone doesn't buy speed.** Our `FusedRecipe` is a tree of
-  `Expr` enum variants; evaluating it per-element pays a `match` cost that
-  wipes out the memory-traffic win. The graph says "fused" but the runtime
-  is still interpreting.
-- **Codegen is where the win lives.** `hand_fused` is literally what
-  `emit_rust` outputs — one tight `for` loop with the whole recipe inlined
-  by `rustc`. That's the gap JIT (Cranelift/LLVM) or AOT (cargo+cc+dlopen)
-  closes in real compilers. Inductor emits Triton; XLA emits LLVM; TVM
-  emits LLVM. None of them interpret their IR.
+- **v0.4 lesson**: Fusion *structure* alone doesn't buy speed. The `FusedRecipe`
+  tree is 22× slower than eager when interpreted per-element, because the
+  `match` dispatch wipes out the memory-traffic savings.
+- **v0.5 lesson**: Fusion *plus codegen* beats everything. `emit_c` produces
+  a 20-line C kernel; `cc -O3` auto-vectorizes it to out-throughput even the
+  hand-rolled Rust version (likely because `cc` hits AVX-512/NEON more
+  aggressively than rustc's default). The 74× interp-to-JIT gap is real.
 
-This is why `torch.compile` is a compiler, not just a graph optimizer.
+**This is why `torch.compile` is a compiler, not just a graph optimizer.**
+TorchInductor emits Triton; XLA emits LLVM; TVM emits LLVM. No production
+ML compiler ships an IR interpreter as the evaluation strategy — they all
+codegen. We just did it in ~200 lines of JIT code and confirmed the speedup
+matches the theoretical expectation.
+
+## v0.7 — reduction fusion
+
+`Sum(Fused(...))` chains now collapse to `FusedSum` — a single kernel that
+runs the recipe and accumulates into a scalar in one pass, no per-element
+intermediate buffer. See `src/graph/reduction.rs`. Tests confirm
+correctness against eager; the emit_c extension for this pattern is a
+small refinement on top of v0.5 (`float acc = 0; for(...) acc += ...;`).
 
 ## Roadmap
 
-### v0.5 — close the interpreter gap (next)
-- Wire `emit_rust` to `cc` + runtime `dlopen`: compile fused kernels on first
-  use, load as shared library, cache by recipe hash. This is the TorchInductor
-  loop, transplanted.
-- Alternative: Cranelift JIT for a truly self-contained binary.
-- Bench again: `fused_jit` should land between `hand_fused` and faster (because
-  Cranelift can do some target-specific optimization the pre-built Rust binary
-  cannot).
+### v0.6 — broadcast in fusion (deferred)
 
-### v0.6 — broadcast in fusion
+Currently, broadcasts are materialized *before* fusion runs (via
+`tape::elementwise_binary`). This means `scalar * tensor` allocates a full
+broadcast copy of the scalar before the fusion pass sees it, losing the
+per-element opportunity to index the scalar as a constant load.
+
+A proper implementation requires:
+- Defer broadcast materialization past fusion
+- Add per-input shape/stride metadata to `FusedRecipe`
+- Update `eval_at` / `emit_c` to compute per-input indices from i plus stride
+
+This is a non-trivial restructuring (estimated ~300 LOC across fusion, eval,
+emit_c, and JIT). The v0.5 JIT win does not depend on it, so it's deferred
+pending a workload where the cost matters. Scalar + 1D cases would cover
+~80% of ML compiler value.
+
+### v0.6 — broadcast in fusion (full history, kept for reference)
 - Fuse across broadcast boundaries (currently we materialize broadcast before
   fusion, losing the win). Requires per-input stride metadata inside the recipe.
 

@@ -67,6 +67,20 @@ impl FusedRecipe {
         }
         Tensor::new(out, shape).expect("FusedRecipe::eval: shape")
     }
+
+    /// v0.7 reduction-fusion path: evaluate the recipe and reduce to a scalar
+    /// sum in one pass. No intermediate per-element buffer is allocated.
+    pub fn eval_sum(&self, inputs: &[&Tensor]) -> Tensor {
+        let n = inputs
+            .first()
+            .map(|t| t.numel())
+            .expect("FusedRecipe::eval_sum: expected at least one external input");
+        let mut acc = 0.0f32;
+        for i in 0..n {
+            acc += eval_at(&self.expr, inputs, i);
+        }
+        Tensor::scalar(acc)
+    }
 }
 
 fn eval_at(expr: &Expr, inputs: &[&Tensor], i: usize) -> f32 {
