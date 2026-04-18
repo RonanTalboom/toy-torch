@@ -10,7 +10,16 @@ thiserror = "1"
 
 [dev-dependencies]
 rand = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "elementwise_chain"
+harness = false
 
 [profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.bench]
 opt-level = 3
 lto = "thin"

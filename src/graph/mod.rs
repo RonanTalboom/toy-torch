@@ -8,17 +8,19 @@
 //! 3. [`compile::dead_code_elim`] removes nodes whose outputs no output uses.
 //! 4. [`Graph::eval`] runs the optimized graph back out.
 
+pub mod codegen;
 pub mod compile;
+pub mod fusion;
 pub mod node;
 pub mod tracer;
+
+pub use node::Node;
 
 use std::collections::{HashMap, HashSet};
 
 use crate::op::Op;
 use crate::tape::TensorId;
 use crate::tensor::Tensor;
-
-use node::Node;
 
 /// An IR-level handle — new numbering, independent of [`TensorId`] so that
 /// compiler passes can renumber freely.
@@ -93,6 +95,16 @@ impl Graph {
                 Op::Sum => {
                     let a = &vals[&node.inputs[0]];
                     a.sum()
+                }
+                Op::Matmul => {
+                    let a = &vals[&node.inputs[0]];
+                    let b = &vals[&node.inputs[1]];
+                    a.matmul2d(b).expect("eval: matmul shape mismatch")
+                }
+                Op::Fused => {
+                    let recipe = node.recipe.as_ref().expect("Fused node missing recipe");
+                    let inputs: Vec<&Tensor> = node.inputs.iter().map(|i| &vals[i]).collect();
+                    recipe.eval(&inputs)
                 }
             };
             vals.insert(id, out);

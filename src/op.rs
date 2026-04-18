@@ -14,8 +14,14 @@ pub enum Op {
     Mul,
     Neg,
     Relu,
+    /// 2D matrix multiplication: `[M, K] @ [K, N] -> [M, N]`.
+    Matmul,
     /// Reduce everything to a scalar.
     Sum,
+    /// A fused chain of elementwise ops, eval'd in one sweep. Produced by the
+    /// fusion compiler pass. The associated recipe lives in
+    /// [`crate::graph::fusion::FusedRecipe`] and is stored on the graph node.
+    Fused,
 }
 
 impl Op {
@@ -25,5 +31,11 @@ impl Op {
 
     pub fn is_elementwise_unary(self) -> bool {
         matches!(self, Op::Neg | Op::Relu)
+    }
+
+    /// Fuseable = pure elementwise, same-shape-after-broadcast. Matmul and Sum
+    /// are not fuseable under this simple scheme.
+    pub fn is_fuseable(self) -> bool {
+        self.is_elementwise_binary() || self.is_elementwise_unary()
     }
 }

@@ -103,6 +103,22 @@ impl Tape {
                     let ga = go.broadcast_to(ta.shape()).expect("sum bw broadcast");
                     accumulate(&mut grads, a, &ga);
                 }
+                Op::Matmul => {
+                    // Y = A @ B;  dA = dY @ B^T;  dB = A^T @ dY
+                    let a = node.inputs[0];
+                    let b = node.inputs[1];
+                    let ta = &self.tensors[a.0];
+                    let tb = &self.tensors[b.0];
+                    let ga = go.matmul2d(&tb.transpose2d()).expect("dA = dY @ B^T");
+                    let gb = ta.transpose2d().matmul2d(&go).expect("dB = A^T @ dY");
+                    accumulate(&mut grads, a, &ga);
+                    accumulate(&mut grads, b, &gb);
+                }
+                Op::Fused => {
+                    // Fused nodes only appear on compiled graphs, not tapes.
+                    // The tape's backward sees original elementwise nodes.
+                    unreachable!("Fused should not appear on the tape; only in compiled graphs");
+                }
             }
         }
 

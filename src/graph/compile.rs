@@ -93,7 +93,9 @@ fn eval_const(g: &Graph, op: Op, inputs: &[NodeId]) -> Tensor {
             Tensor::new(data, t.shape().clone()).expect("relu fold")
         }
         Op::Sum => as_tensor(inputs[0]).sum(),
-        Op::Leaf | Op::Const => unreachable!("Leaf/Const are not foldable"),
+        Op::Leaf | Op::Const | Op::Matmul | Op::Fused => {
+            unreachable!("op {:?} not in is_foldable set", op)
+        }
     }
 }
 
@@ -116,6 +118,7 @@ pub fn dead_code_elim(g: &Graph) -> Graph {
             op: node.op,
             inputs: new_inputs,
             constant: node.constant.clone(),
+            recipe: node.recipe.clone(),
         };
         let new_id = out.push(new_node);
         rewrite.insert(old_id, new_id);

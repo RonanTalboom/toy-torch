@@ -139,6 +139,15 @@ impl Tape {
         self.record(Op::Relu, vec![a], out)
     }
 
+    // ---- matmul ----
+
+    pub fn matmul(&mut self, a: TensorId, b: TensorId) -> TensorId {
+        let out = self.tensors[a.0]
+            .matmul2d(&self.tensors[b.0])
+            .expect("matmul: shape mismatch");
+        self.record(Op::Matmul, vec![a, b], out)
+    }
+
     // ---- reduce ----
 
     pub fn sum(&mut self, a: TensorId) -> TensorId {

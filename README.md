@@ -1,8 +1,8 @@
 # toy-torch
 
-A minimal PyTorch-shaped crate in Rust. **~1300 lines**, zero heavy dependencies
-(only `thiserror` + `rand` for examples), built to teach DL compiler internals
-by implementing them.
+A minimal PyTorch-shaped crate in Rust. **~2300 lines**, one runtime dep
+(`thiserror`) plus `rand` and `criterion` for examples / benches. Built to
+teach DL compiler internals by implementing them.
 
 Not a framework. A learning artifact. Written after a /research session on the
 [NVIDIA DL Compiler Engineer role](learning/Career/nvidia-dl-compiler-learning-path.md)
@@ -14,13 +14,15 @@ right one.
 | Layer | File | What it does |
 |-------|------|--------------|
 | Shape | `src/shape.rs` | Row-major strides, NumPy broadcasting, unbroadcast-axis discovery for backward |
-| Tensor | `src/tensor.rs` | CPU f32, contiguous storage, `broadcast_to`, `sum_axes`, `reshape` |
-| Op | `src/op.rs` | The shared vocabulary (Leaf/Const/Add/Sub/Mul/Neg/Relu/Sum) used by both tape + graph |
+| Tensor | `src/tensor.rs` | CPU f32, contiguous storage, `broadcast_to`, `sum_axes`, `reshape`, `transpose2d`, naive `matmul2d` |
+| Op | `src/op.rs` | Shared vocabulary (Leaf/Const/Add/Sub/Mul/Neg/Relu/Matmul/Sum/Fused) for tape + graph |
 | Tape | `src/tape.rs` | Arena-based autograd tape; explicit `&mut Tape` (no global, no `Rc<RefCell>`) |
-| Autograd | `src/autograd.rs` | Reverse-mode `backward()`; handles broadcasting via `accumulate_with_unbroadcast` |
-| Graph IR | `src/graph/node.rs`, `graph/mod.rs` | Separate IR from the tape — nodes carry structure only, not values |
+| Autograd | `src/autograd.rs` | Reverse-mode `backward()`; unbroadcast-aware, including matmul (dA = dY@Bᵀ, dB = Aᵀ@dY) |
+| Graph IR | `src/graph/node.rs`, `graph/mod.rs` | Separate IR from the tape — nodes carry structure, recipes, or constants |
 | Tracer | `src/graph/tracer.rs` | Tape → Graph conversion |
 | Compiler | `src/graph/compile.rs` | `constant_fold` + `dead_code_elim` passes |
+| Fusion | `src/graph/fusion.rs` | Elementwise-chain fusion; collapses chains into `Op::Fused` nodes with `FusedRecipe` expression tree |
+| Codegen | `src/graph/codegen.rs` | `emit_rust` — walks a `FusedRecipe` and emits equivalent Rust source (demonstration of what JIT/AOT codegen would do) |
 
 ## Design decisions worth surfacing
 
@@ -50,9 +52,12 @@ right one.
 
 ```bash
 cargo build
-cargo test                              # 10 unit + 5 autograd + 4 compile + 1 doctest
-cargo run --release --example linreg    # SGD converges to target in ~200 epochs
+cargo test                              # 12 unit + 5 autograd + 3 fusion + 4 compile + 3 codegen + 2 matmul + 1 doctest
+cargo run --release --example linreg    # SGD: y = sum(x * w) + b converges to target in ~200 epochs
+cargo run --release --example mlp       # 4→8→1 MLP trains to loss 0.005 in 500 epochs via matmul + relu
 cargo run --release --example compile   # 10 traced nodes → 4 after const-fold + DCE
+cargo run --release --example fuse      # demonstrates tracer + fold + fusion + DCE + emit_rust on a chain
+cargo bench --bench elementwise_chain   # eager_vec vs hand_fused vs fused_interp on 1K-1M sizes
 ```
 
 Expected output for `linreg` (seed 42, 200 epochs):
@@ -76,24 +81,51 @@ compiled graph loss: [33.0]
   [3] Sum inputs=[NodeId(2)]
 ```
 
+## What the bench says (v0.4)
+
+Memory-bound elementwise chain `out = relu((x - y) * z) + x * k`, 1 M elements:
+
+| Variant | Throughput | Relative |
+|---------|-----------|----------|
+| `eager_vec` — 5 loops with 5 Vec<f32> intermediates | 1.9 Gelem/s | 1.0× |
+| `hand_fused` — single loop (what `emit_rust` generates) | **5.8 Gelem/s** | **3.0×** |
+| `fused_interp` — `Graph::eval()` on fused recipe | 85 Melem/s | **0.04×** |
+
+This is the punchline of the whole project:
+
+- **Fusion structure alone doesn't buy speed.** Our `FusedRecipe` is a tree of
+  `Expr` enum variants; evaluating it per-element pays a `match` cost that
+  wipes out the memory-traffic win. The graph says "fused" but the runtime
+  is still interpreting.
+- **Codegen is where the win lives.** `hand_fused` is literally what
+  `emit_rust` outputs — one tight `for` loop with the whole recipe inlined
+  by `rustc`. That's the gap JIT (Cranelift/LLVM) or AOT (cargo+cc+dlopen)
+  closes in real compilers. Inductor emits Triton; XLA emits LLVM; TVM
+  emits LLVM. None of them interpret their IR.
+
+This is why `torch.compile` is a compiler, not just a graph optimizer.
+
 ## Roadmap
 
-### v0.2 — fusion and matmul
-- `Matmul` op with 2D-only semantics + analytic backward
-- Elementwise fusion pass (merge chains of unary/binary ops into one `Fused`
-  node; eval as one sweep to reduce memory traffic)
-- `Mean` reduce + numerical-stable `LogSoftmax`
-- MLP example — demonstrate gradient flow through relu + matmul
+### v0.5 — close the interpreter gap (next)
+- Wire `emit_rust` to `cc` + runtime `dlopen`: compile fused kernels on first
+  use, load as shared library, cache by recipe hash. This is the TorchInductor
+  loop, transplanted.
+- Alternative: Cranelift JIT for a truly self-contained binary.
+- Bench again: `fused_jit` should land between `hand_fused` and faster (because
+  Cranelift can do some target-specific optimization the pre-built Rust binary
+  cannot).
 
-### v0.3 — compiler backends
-- Replace the graph-interpreter `eval` with a codegen backend
-- Target 1: emit Rust source that a separate `cargo build` compiles and runs
-- Target 2: emit LLVM IR via `inkwell` or Cranelift for JIT compilation
-- This is where the compiler curriculum's Domain 1 (codegen) pays off
+### v0.6 — broadcast in fusion
+- Fuse across broadcast boundaries (currently we materialize broadcast before
+  fusion, losing the win). Requires per-input stride metadata inside the recipe.
 
-### v0.4 — differential benchmarks
-- Bench suite comparing eager vs compiled on three shapes: memory-bound,
-  compute-bound, fused-chain-bound
+### v0.7 — reduction fusion
+- Fuse `sum(elementwise(...))` chains into one pass with a running accumulator.
+  This is where the interesting fusion algorithms live (vertical + horizontal).
+
+### v0.8 — differential benchmark suite
+- Three shapes: memory-bound, compute-bound, fused-chain-bound
 - Roofline plots via cached profiling runs
 - A "which optimization bought how much speedup" attribution dashboard
 

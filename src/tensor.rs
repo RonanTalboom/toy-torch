@@ -155,6 +155,53 @@ impl Tensor {
         Tensor::scalar(total)
     }
 
+    /// 2D transpose. Returns a new contiguous tensor with swapped axes.
+    /// Panics if `self` is not rank-2.
+    pub fn transpose2d(&self) -> Tensor {
+        let dims = self.shape.dims();
+        assert_eq!(dims.len(), 2, "transpose2d: expected rank-2 tensor");
+        let (m, n) = (dims[0], dims[1]);
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                out[j * m + i] = self.data[i * n + j];
+            }
+        }
+        Tensor::new(out, Shape::new(&[n, m])).expect("transpose2d: internal")
+    }
+
+    /// Naive 2D matmul: `self [M, K] @ rhs [K, N] -> [M, N]`. Three nested
+    /// loops, no cache blocking, no BLAS. This is the correct implementation
+    /// for the teaching goal — a reader can trace every memory access.
+    pub fn matmul2d(&self, rhs: &Tensor) -> Result<Tensor> {
+        let a_dims = self.shape.dims();
+        let b_dims = rhs.shape.dims();
+        if a_dims.len() != 2 || b_dims.len() != 2 {
+            return Err(Error::InvalidShape(format!(
+                "matmul2d: expected 2D operands, got {:?} and {:?}",
+                a_dims, b_dims
+            )));
+        }
+        if a_dims[1] != b_dims[0] {
+            return Err(Error::ShapeMismatch {
+                lhs: a_dims.to_vec(),
+                rhs: b_dims.to_vec(),
+            });
+        }
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let n = b_dims[1];
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for l in 0..k {
+                let a_il = self.data[i * k + l];
+                for j in 0..n {
+                    out[i * n + j] += a_il * rhs.data[l * n + j];
+                }
+            }
+        }
+        Tensor::new(out, Shape::new(&[m, n]))
+    }
+
     /// Reshape without moving data (must match numel).
     pub fn reshape(&self, dims: &[usize]) -> Result<Tensor> {
         let new_shape = Shape::new(dims);
@@ -218,5 +265,24 @@ mod tests {
     fn sum_total() {
         let t = Tensor::from_vec(&[1.0, 2.0, 3.0], &[3]);
         assert_eq!(t.sum().data(), &[6.0]);
+    }
+
+    #[test]
+    fn transpose_2x3() {
+        let t = Tensor::from_vec(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let tt = t.transpose2d();
+        assert_eq!(tt.shape().dims(), &[3, 2]);
+        assert_eq!(tt.data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn matmul_2x3_3x2() {
+        let a = Tensor::from_vec(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let b = Tensor::from_vec(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2]);
+        let c = a.matmul2d(&b).unwrap();
+        // [1*7+2*9+3*11, 1*8+2*10+3*12; 4*7+5*9+6*11, 4*8+5*10+6*12]
+        // = [58, 64; 139, 154]
+        assert_eq!(c.shape().dims(), &[2, 2]);
+        assert_eq!(c.data(), &[58.0, 64.0, 139.0, 154.0]);
     }
 }
